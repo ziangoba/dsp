@@ -1,0 +1,445 @@
+/****************************************************************************/
+/*                                                                          */
+/*              无限长单位冲激响应滤波器测试                               									*/
+/*                                                                          */
+/*              2021年09月28日                                           								  	*/
+/*                                                                          */
+/****************************************************************************/
+/*创龙 DSP6748 开发板相关声明*/
+#include "TL6748.h"
+/*C 语言标准输入输出函数库*/
+#include <stdio.h>
+/*C 语言字符函数库*/
+#include <string.h>
+/*C 数学函数库*/
+#include <math.h>
+/*DSP 数学函数库*/
+#include "mathlib.h"
+/*DSP 函数库*/
+#include "dsplib.h"
+
+#include "uart.h"
+#include "hw_uart.h"
+#include "hw_types.h"
+#include "psc.h"
+#include "interrupt.h"
+#include "soc_C6748.h"
+#include "hw_psc_C6748.h"
+
+#include "raster.h"
+#include "grlib.h"
+#include "widget.h"
+#include "canvas.h"
+#include "pushbutton.h"
+#include "checkbox.h"
+#include "radiobutton.h"
+#include "container.h"
+#include "slider.h"
+#include "uartStdio.h"
+#include "delay.h"
+
+/****************************************************************************/
+/*                                                                          */
+/*              宏定义															*/
+/*                                                                          */
+/****************************************************************************/
+/*系统滴答次数与周期*/
+#define SYSTICKS_PER_SECOND      100
+#define SYSTICK_PERIOD_MS       (1000 / SYSTICKS_PER_SECOND)
+/*LCD 显示常量*/
+#define TEXT_FONT               &g_sFontCmss22b
+#define TEXT_HEIGHT             (GrFontHeightGet(TEXT_FONT))
+#define BUFFER_METER_HEIGHT     TEXT_HEIGHT
+#define BUFFER_METER_WIDTH      150
+/*LCD 时钟*/
+#define LCD_CLK                 228000000
+#define PALETTE_SIZE            32
+/*LCD 分辨率*/
+#define LCD_WIDTH               800
+#define LCD_HEIGHT              480
+#define PALETTE_OFFSET          4
+/*有限长单位冲激响应滤波器*/
+/*π 及 浮点数极小值*/
+#define PI                3.14159
+#define F_TOL             (1e-06)
+/****************************************************************************/
+/*                                                                          */
+/*              全局变量														*/
+/*                                                                          */
+/****************************************************************************/
+#pragma DATA_ALIGN(g_pucBuffer, 4);
+unsigned char g_pucBuffer[GrOffScreen16BPPSize(LCD_WIDTH, LCD_HEIGHT)];
+/*图形库显示结构*/
+tDisplay g_sSHARP800x480x16Display;
+/*调色板*/
+unsigned short palette_32b[PALETTE_SIZE/2] = 
+			{0x4000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u,
+			 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u, 0x0000u};
+/*全局显示上下文*/
+tContext g_sContext;
+/*atoi转换后的文字*/
+char atoi_num[10];
+/*
+ * 无限长单位冲激响应滤波器测试测试
+ * 测试无限长单位冲激响应滤波器
+ */
+/*样品数*/
+#define Tn  1024
+/*采样频率*/
+#define Fs  1000.0
+/*滤波器阶数*/
+#define N 	5
+/*信号*/
+/*IIR 输入*/
+#pragma DATA_ALIGN(IIR_In, 8);
+float IIR_In[Tn];
+
+/*IIR 输出*/
+#pragma DATA_ALIGN(IIR_Out, 8);
+float IIR_Out[Tn+4];
+
+/*IIR延迟元素值*/
+#pragma DATA_ALIGN(ptr_y1, 8);
+float ptr_y1[Tn+4];
+
+/*IIR 系数*/
+#pragma DATA_ALIGN (NUM, 8);
+#pragma DATA_ALIGN (DEN, 8);
+/*滑动平均系数*/
+const float NUM[5] = {0.0185630098,  0.07425203919,   0.1113780662,  0.07425203919,   0.0185630098};
+/*自回归系数*/
+const float DEN[5] = {1,   -1.570398808,    1.275613308,  -0.4844033718,   0.07619706541};
+/****************************************************************************/
+/*                                                                          */
+/*              函数声明														*/
+/*                                                                          */
+/****************************************************************************/
+void GPIOBankPinMuxSet(void);
+void LCDIsr(void);
+void PSCInit(void);
+void LCDInit(void);
+void SetUpLCD(void);
+void InterruptInit(void);
+void LCDInterruptInit(void);
+char* itoa(int value,char*string,int radix);
+void IIRTest();
+void IIRToLcd(void);
+/****************************************************************************/
+/*                                                                          */
+/*              主函数															*/
+/*                                                                          */
+/****************************************************************************/
+int main(void)
+{
+	/*串口终端初始化 使用串口2*/
+   	UARTStdioInit();
+   	/*外设使能配置*/
+   	PSCInit();
+    /*管脚复用配置*/
+    GPIOBankPinMuxSet();
+    /*DSP 中断初始化*/
+    InterruptInit();
+    /*LCD 中断初始化*/
+    LCDInterruptInit();
+	/*LCD 初始化*/
+	LCDInit();
+	/*设置lcd*/
+	SetUpLCD();
+
+	/*IIR 测试*/
+	IIRTest();
+
+	IIRToLcd();
+
+    for(;;)
+    {
+
+    }
+}
+/****************************************************************************/
+/*                                                                          */
+/*              LCD 中断服务函数													*/
+/*                                                                          */
+/****************************************************************************/
+void LCDIsr(void)
+{
+    unsigned int  status;
+    IntEventClear(SYS_INT_LCDC_INT);
+    status = RasterIntStatus(SOC_LCDC_0_REGS,RASTER_END_OF_FRAME0_INT_STAT |
+                                             RASTER_END_OF_FRAME1_INT_STAT );
+    status = RasterClearGetIntStatus(SOC_LCDC_0_REGS, status);    
+}
+/****************************************************************************/
+/*                                                                          */
+/*              PSC 初始化														*/
+/*                                                                          */
+/****************************************************************************/
+void PSCInit(void)
+{
+	/*
+	 * 对相应外设模块的使能也可以在 BootLoader 中完成
+	 * 使能 LCD 模块
+	 */
+    PSCModuleControl(SOC_PSC_1_REGS, HW_PSC_LCDC, PSC_POWERDOMAIN_ALWAYS_ON, PSC_MDCTL_NEXT_ENABLE);
+}
+/****************************************************************************/
+/*                                                                          */
+/*              GPIO 管脚复用配置												*/
+/*                                                                          */
+/****************************************************************************/
+void GPIOBankPinMuxSet(void)
+{
+	LCDPinMuxSetup();
+}
+/****************************************************************************/
+/*                                                                          */
+/*              LCD 初始化														*/
+/*                                                                          */
+/****************************************************************************/
+void LCDInit(void)
+{
+    /*禁用光栅*/
+    RasterDisable(SOC_LCDC_0_REGS);
+    
+    /*时钟配置*/
+    RasterClkConfig(SOC_LCDC_0_REGS,38000000,LCD_CLK);
+
+    /*配置 LCD DMA 控制器*/
+    RasterDMAConfig(SOC_LCDC_0_REGS, RASTER_DOUBLE_FRAME_BUFFER,
+                    RASTER_BURST_SIZE_16, RASTER_FIFO_THRESHOLD_8,
+                    RASTER_BIG_ENDIAN_DISABLE);
+
+    /*模式配置(例如:TFT 或者 STN,彩色或者黑白 等等)*/
+    RasterModeConfig(SOC_LCDC_0_REGS, RASTER_DISPLAY_MODE_TFT,
+                     RASTER_PALETTE_DATA, RASTER_COLOR, RASTER_RIGHT_ALIGNED);
+
+    /*帧缓存数据以 LSB 方式排列*/
+    RasterLSBDataOrderSelect(SOC_LCDC_0_REGS);
+    
+    /*禁用 Nibble 模式*/
+    RasterNibbleModeDisable(SOC_LCDC_0_REGS);
+   
+    /*配置光栅控制器极性*/
+    RasterTiming2Configure(SOC_LCDC_0_REGS, RASTER_FRAME_CLOCK_LOW |
+                                            RASTER_LINE_CLOCK_LOW  |
+                                            RASTER_PIXEL_CLOCK_HIGH |
+                                            RASTER_SYNC_EDGE_RISING|
+                                            RASTER_SYNC_CTRL_ACTIVE|
+                                            RASTER_AC_BIAS_HIGH     , 0, 255);
+
+	/*配置水平 / 垂直参数*/
+    RasterHparamConfig(SOC_LCDC_0_REGS, 800, 30, 210, 45);
+	RasterVparamConfig(SOC_LCDC_0_REGS, 480, 10, 21, 22);
+
+	/*配置 FIFO DMA 延时*/
+	RasterFIFODMADelayConfig(SOC_LCDC_0_REGS, 2);
+}
+/****************************************************************************/
+/*                                                                          */
+/*              设置LCD参数													*/
+/*                                                                          */
+/****************************************************************************/
+void SetUpLCD(void)
+{
+    unsigned int i = 0;
+	unsigned char *src, *dest;
+  	/*配置基本框架*/
+	RasterDMAFBConfig(SOC_LCDC_0_REGS,
+					  (unsigned int)(g_pucBuffer+PALETTE_OFFSET),
+					  (unsigned int)(g_pucBuffer+PALETTE_OFFSET) + sizeof(g_pucBuffer) - 2 - PALETTE_OFFSET,
+					  0);
+
+	RasterDMAFBConfig(SOC_LCDC_0_REGS,
+					  (unsigned int)(g_pucBuffer+PALETTE_OFFSET),
+					  (unsigned int)(g_pucBuffer+PALETTE_OFFSET) + sizeof(g_pucBuffer) - 2 - PALETTE_OFFSET,
+					  1);
+
+	/*拷贝调色板到离屏显存中*/
+	src = (unsigned char *) palette_32b;
+	dest = (unsigned char *) (g_pucBuffer+PALETTE_OFFSET);
+	for( i = 4; i < (PALETTE_SIZE+4); i++)
+	{
+		*dest++ = *src++;
+	}
+
+	/*初始化离屏显存*/
+	GrOffScreen16BPPInit(&g_sSHARP800x480x16Display, g_pucBuffer, LCD_WIDTH, LCD_HEIGHT);
+
+	/*初始化显存上下文.*/
+	GrContextInit(&g_sContext, &g_sSHARP800x480x16Display);
+
+	/*使能LCD帧结束中断*/
+	RasterEndOfFrameIntEnable(SOC_LCDC_0_REGS);
+
+	/*使能光栅*/
+	RasterEnable(SOC_LCDC_0_REGS);
+	ConfigRasterDisplayEnable();
+}
+/****************************************************************************/
+/*                                                                          */
+/*              DSP 中断初始化  													*/
+/*                                                                          */
+/****************************************************************************/
+void InterruptInit(void)
+{
+	/*初始化 DSP 中断控制器*/
+	IntDSPINTCInit();
+	/*使能 DSP 全局中断*/
+	IntGlobalEnable();
+}
+/****************************************************************************/
+/*                                                                          */
+/*              LCD 中断初始化													*/
+/*                                                                          */
+/****************************************************************************/
+void LCDInterruptInit(void)
+{
+	/*注册中断服务函数*/
+    IntRegister(C674X_MASK_INT5, LCDIsr);
+	/*映射中断事件*/
+    IntEventMap(C674X_MASK_INT5, SYS_INT_LCDC_INT);
+    /*使能可屏蔽中断*/
+    IntEnable(C674X_MASK_INT5);
+}
+/****************************************************************************/
+/*                                                                          */
+/*               int转char函数													*/
+/*                                                                          */
+/****************************************************************************/
+char* itoa(int num,char* str,int radix)
+{
+	/*索引表*/
+    char index[]="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    /*存放要转换的整数的绝对值,转换的整数可能是负数*/
+    unsigned unum;
+    /*i用来指示设置字符串相应位，转换之后i其实就是字符串的长度；转换后顺序是逆序的，有正负的情况，k用来指示调整顺序的开始位置;j用来指示调整顺序时的交换。*/
+    int i=0,j,k;
+    /*获取要转换的整数的绝对值*/
+    /*要转换成十进制数并且是负数*/
+    if(radix==10&&num<0)
+    {
+    	/*将num的绝对值赋给unum*/
+        unum=(unsigned)-num;
+        /*在字符串最前面设置为'-'号，并且索引加1*/
+        str[i++]='-';
+    }
+    else
+    {
+    	/*若是num为正，直接赋值给unum*/
+    	unum=(unsigned)num;
+    }
+    /*转换部分，注意转换后是逆序的*/
+    do
+    {
+    	/*取unum的最后一位，并设置为str对应位，指示索引加1*/
+        str[i++]=index[unum%(unsigned)radix];
+        /*unum去掉最后一位*/
+        unum/=radix;
+    }while(unum);/*直至unum为0退出循环*/
+
+    /*在字符串最后添加'\0'字符，c语言字符串以'\0'结束。*/
+    str[i]='\0';
+
+    /*将顺序调整过来*/
+    /*如果是负数，符号不用调整，从符号后面开始调整*/
+    if(str[0]=='-') k=1;
+    else k=0;/*不是负数，全部都要调整*/
+
+    /*临时变量，交换两个值时用到*/
+    char temp;
+    /*头尾一一对称交换，i其实就是字符串的长度，索引最大值比长度少1*/
+    for(j=k;j<=(i-1)/2;j++)
+    {
+    	/*头部赋值给临时变量*/
+        temp=str[j];
+        /*尾部赋值给头部*/
+        str[j]=str[i-1+k-j];
+        /*将临时变量的值(其实就是之前的头部值)赋给尾部*/
+        str[i-1+k-j]=temp;
+    }
+    /*返回转换后的字符串*/
+    return str;
+
+}
+
+/****************************************************************************/
+/*                                                                          */
+/*              无限长单位冲激响应滤波器测试                               									*/
+/*                                                                          */
+/****************************************************************************/
+/*无限长单位冲激响应滤波器*/
+void IIRTest(void)
+{
+	/*将延迟元素值全部清0*/
+	memset(ptr_y1, 0, sizeof(ptr_y1));
+
+	/*产生待测试信号 100hz信号 450hz噪声*/
+	unsigned int i;
+	for (i=0;i<Tn;i++)
+		IIR_In[i]=5*sin(2*PI*100*(i/Fs))+15*sin(2*PI*450*(i/Fs));
+
+	/*IIR滤波*/
+	DSPF_sp_iir (ptr_y1, IIR_In, IIR_Out, NUM, DEN, Tn+4);
+}
+
+
+/****************************************************************************/
+/*                                                                          */
+/*               IIR输出的结果显示到LCD											*/
+/*                                                                          */
+/****************************************************************************/
+void IIRToLcd(void)
+{
+	unsigned int i = 0;
+
+  	GrContextForegroundSet(&g_sContext, ClrWhite);
+  	GrContextFontSet(&g_sContext, TEXT_FONT);
+  	/*
+  	 * 分割线
+  	 */
+  	GrLineDraw(&g_sContext, 0, 240, 800,240);
+  	/*
+  	 * 生成标题
+  	 */
+  	GrStringDraw(&g_sContext, "IIR In", -1, 360, 0, false);
+  	GrStringDraw(&g_sContext, "IIR Out", -1, 360, 240, false);
+  	/*
+  	 * FIR_In的数据显示到LCD
+  	 */
+    for(i = 4 ; i < 100-1 ; i++)
+    	GrLineDraw(&g_sContext, i*8, 110-((int)((IIR_In[i-4]*5)+0.5)), (i+1)*8, 110-((int)((IIR_In[i+1-4]*5)+0.5)));
+
+    /*
+     * FIR_Out的数据显示到LCD
+     */
+    for(i = 3 ; i < 100-1 ; i++)
+		GrLineDraw(&g_sContext, i*8, 360-((int)((IIR_Out[i-3]*20)+0.5)), (i+1)*8, 360-((int)((IIR_Out[i+1-3]*20)+0.5)));
+    /*
+     * 横坐标生成
+     */
+  	GrLineDraw(&g_sContext, 20, 460, 800, 460);
+  	GrLineDraw(&g_sContext, 30, 220, 800, 220);
+
+    for(i = 0 ; i < 10 ; i++){
+
+    	GrLineDraw(&g_sContext,i*80+20,460,i*80+20,450);
+    	GrLineDraw(&g_sContext,i*80+30,220,i*80+30,210);
+
+    	GrStringDraw(&g_sContext, itoa((i)*10,atoi_num,10), -1, 80*i+10, 460, false);
+    	GrStringDraw(&g_sContext, itoa((i)*10,atoi_num,10), -1, 80*i+20, 220, false);
+    }
+    /*
+     * 纵坐标生成
+     */
+    GrLineDraw(&g_sContext, 20, 460, 20, 240);
+    GrLineDraw(&g_sContext, 30, 220, 30, 0 );
+
+    for(i = 0 ; i < 10 ; i++){
+
+    	GrLineDraw(&g_sContext, 20, 440-i*20, 30,440-i*20);
+    	GrLineDraw(&g_sContext, 30, 200-i*20, 40,200-i*20);
+
+    	GrStringDraw(&g_sContext, itoa((i-5),atoi_num,10), -1, 0, 430-i*20, false);
+    	GrStringDraw(&g_sContext, itoa((i*4-18),atoi_num,10), -1, 0, 190-i*20, false);
+    }
+}
